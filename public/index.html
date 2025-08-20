@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Restaurant Voice Agent</title>
+    <style>
+        body {
+            font-family: system-ui, Arial, sans-serif;
+            max-width: 920px;
+            margin: 24px auto;
+            padding: 0 12px
+        }
+
+        header {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px
+        }
+
+        .card {
+            border: 1px solid #ddd;
+            border-radius: 12px;
+            padding: 12px;
+            margin: 12px 0
+        }
+
+        .row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap
+        }
+
+        input[type=file] {
+            padding: 8px
+        }
+
+        button {
+            padding: 10px 14px;
+            border: 0;
+            border-radius: 10px;
+            background: #111;
+            color: #fff;
+            cursor: pointer
+        }
+
+        button.secondary {
+            background: #eee;
+            color: #111
+        }
+
+        #status {
+            font-size: 14px;
+            color: #555
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse
+        }
+
+        th,
+        td {
+            border-bottom: 1px solid #eee;
+            padding: 8px;
+            text-align: left
+        }
+
+        .right {
+            text-align: right
+        }
+
+        .pill {
+            background: #f3f3f3;
+            border-radius: 999px;
+            padding: 3px 9px;
+            font-size: 12px
+        }
+
+        #transcript {
+            white-space: pre-wrap;
+            font-size: 14px;
+            color: #333
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <h1>🍽️ Voice Waiter</h1>
+        <div id="status" class="pill">idle</div>
+    </header>
+
+    <div class="card">
+        <div class="row">
+            <input id="csv" type="file" accept=".csv" />
+            <button id="connectBtn">🎤 Start voice</button>
+            <button id="hangBtn" class="secondary">⛔ Stop</button>
+        </div>
+        <small>Dica: carregue um CSV com colunas <b>name,price</b> (e opcional <b>description</b>).</small>
+    </div>
+
+    <div class="card">
+        <h3>Order</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Item</th>
+                    <th class="right">Qty</th>
+                    <th class="right">Price</th>
+                    <th class="right">Subtotal</th>
+                </tr>
+            </thead>
+            <tbody id="orderBody"></tbody>
+            <tfoot>
+                <tr>
+                    <td colspan="3" class="right"><b>Total</b></td>
+                    <td class="right" id="orderTotal">0.00</td>
+                </tr>
+            </tfoot>
+        </table>
+    </div>
+
+    <div class="card">
+        <h3>Last transcript</h3>
+        <div id="transcript">(fala do cliente → texto)</div>
+    </div>
+
+    <script type="module">
+        /* ---------- 0) Estado local ---------- */
+        let pc, dataChannel, micStream;
+        let menu = [];  // [{name, price, description}]
+        const order = new Map(); // key=name -> {name, price, qty}
+
+        /* ---------- 1) Utilitários ---------- */
+        function parseCSV(text) {
+            // parser simples (espera cabeçalho: name,price,description)
+            const lines = text.trim().split(/\r?\n/);
+            const head = lines.shift().split(",").map(s => s.trim().toLowerCase());
+            const nameIdx = head.indexOf("name");
+            const priceIdx = head.indexOf("price");
+            const descIdx = head.indexOf("description");
+            const out = [];
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                const cols = line.split(",").map(s => s.trim());
+                const name = cols[nameIdx];
+                const price = Number(String(cols[priceIdx]).replace(/[^\d.,-]/g, "").replace(",", "."));
+                const description = descIdx >= 0 ? cols[descIdx] : "";
+                if (name && !Number.isNaN(price)) out.push({ name, price, description });
+            }
+            return out;
+        }
+
+        function renderOrder() {
+            const tbody = document.getElementById("orderBody");
+            tbody.innerHTML = "";
+            let total = 0;
+            for (const { name, price, qty } of order.values()) {
+                const sub = price * qty;
+                total += sub;
+                const tr = document.createElement("tr");
+                tr.innerHTML = `
+      <td>${name}</td>
+      <td class="right">${qty}</td>
+      <td class="right">${price.toFixed(2)}</td>
+      <td class="right">${sub.toFixed(2)}</td>`;
+                tbody.appendChild(tr);
+            }
+            document.getElementById("orderTotal").textContent = total.toFixed(2);
+        }
+
+        function setStatus(s) { document.getElementById("status").textContent = s; }
+
+        function send(event) {
+            // Envia evento JSON pelo data channel
+            if (dataChannel?.readyState === "open") dataChannel.send(JSON.stringify(event));
+        }
+
+        /* ---------- 2) Tools (funções que o modelo pode chamar) ---------- */
+        const tools = {
+            add_to_order: ({ name, quantity }) => {
+                const item = menu.find(m => m.name.toLowerCase() === String(name || "").toLowerCase());
+                if (!item) return { ok: false, error: `Item "${name}" not found` };
+                const prev = order.get(item.name) || { name: item.name, price: item.price, qty: 0 };
+                prev.qty += Number(quantity || 1);
+                order.set(item.name, prev);
+                renderOrder();
+                return { ok: true, line: { name: prev.name, qty: prev.qty, price: prev.price } };
+            },
+            remove_from_order: ({ name, quantity }) => {
+                const key = [...order.keys()].find(k => k.toLowerCase() === String(name || "").toLowerCase());
+                if (!key) return { ok: false, error: `Item "${name}" not in order` };
+                const row = order.get(key);
+                row.qty -= Number(quantity || 1);
+                if (row.qty <= 0) order.delete(key); else order.set(key, row);
+                renderOrder();
+                return { ok: true };
+            },
+            get_order_summary: () => {
+                const lines = [...order.values()].map(({ name, qty, price }) => ({ name, qty, price, subtotal: qty * price }));
+                const total = lines.reduce((s, l) => s + l.subtotal, 0);
+                return { items: lines, total };
+            },
+            list_menu_items: ({ query }) => {
+                const q = String(query || "").toLowerCase();
+                return { items: menu.filter(m => !q || m.name.toLowerCase().includes(q)) };
+            }
+        };
+
+        // Definições (esquema) que o modelo vê no "session.update"
+        const toolDefs = [
+            {
+                type: "function",
+                name: "add_to_order",
+                description: "Add an item to the current order",
+                parameters: {
+                    type: "object",
+                    properties: { name: { type: "string" }, quantity: { type: "integer", minimum: 1 } },
+                    required: ["name"]
+                }
+            },
+            {
+                type: "function",
+                name: "remove_from_order",
+                description: "Remove quantity of an item (delete if qty<=0)",
+                parameters: {
+                    type: "object",
+                    properties: { name: { type: "string" }, quantity: { type: "integer", minimum: 1 } },
+                    required: ["name"]
+                }
+            },
+            {
+                type: "function",
+                name: "get_order_summary",
+                description: "Return a summary of the order with total",
+                parameters: { type: "object", properties: {} }
+            },
+            {
+                type: "function",
+                name: "list_menu_items",
+                description: "List menu items, optionally filtered by a query substring",
+                parameters: { type: "object", properties: { query: { type: "string" } } }
+            }
+        ];
+
+        /* ---------- 3) CSV upload ---------- */
+        document.getElementById("csv").addEventListener("change", async (e) => {
+            const file = e.target.files?.[0];
+            if (!file) return;
+            const text = await file.text();
+            menu = parseCSV(text);
+            if (menu.length === 0) alert("CSV vazio ou cabeçalho inválido. Campos esperados: name,price[,description]");
+        });
+
+        /* ---------- 4) Realtime WebRTC: start/stop ---------- */
+        async function start() {
+            setStatus("preparing…");
+            // 1) pega token efêmero
+            const token = await fetch("/session").then(r => r.json());
+
+            // 2) cria conexão WebRTC
+            pc = new RTCPeerConnection();
+            dataChannel = pc.createDataChannel("oai-events");
+            dataChannel.onopen = () => {
+                setStatus("listening");
+                console.log("IA está escutando o áudio!");
+            };
+            dataChannel.onmessage = onEventFromModel;
+
+            // áudio remoto (voz do modelo)
+            const audioEl = document.createElement("audio");
+            audioEl.autoplay = true;
+            pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; };
+
+            // microfone local
+            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
+
+            // 3) troca SDP com OpenAI
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            const baseUrl = "https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+            const sdpResponse = await fetch(baseUrl, {
+                method: "POST",
+                body: offer.sdp,
+                headers: {
+                    "Authorization": `Bearer ${token.client_secret.value}`,
+                    "Content-Type": "application/sdp"
+                }
+            });
+            const answer = { type: "answer", sdp: await sdpResponse.text() };
+            await pc.setRemoteDescription(answer);
+
+            // 4) envia instruções + tools + menu pro modelo
+            dataChannel.onopen = () => {
+                setStatus("ready");
+                // Atualiza sessão com instruções e tools
+                send({
+                    type: "session.update",
+                    session: {
+                        instructions: `Você é um assistente de voz para restaurante.
+- Sempre fale e escreva apenas em *português do Brasil*.
+- Seja simpático e objetivo.
+- Confirme os itens pedidos em português, nunca traduza nomes próprios.
+- Use apenas as ferramentas fornecidas para gerenciar o pedido.
+- Preços estão no CSV fornecido; não invente itens.
+- Quando o cliente perguntar "o que tem", liste alguns itens com preços em reais (R$).
+- Ao final, ofereça resumo e total do pedido.`,
+
+                        tools: toolDefs
+                    }
+                });
+
+                // Injeta o menu como contexto de sistema
+                send({
+                    type: "input_audio_buffer.commit" // (no-op marker helps some clients)
+                });
+
+                // Envia uma mensagem inicial com o menu em JSON para o modelo conhecer as opções
+                send({
+                    type: "response.create",
+                    response: {
+                        instructions: `Converse em português do Brasil sempre.`,
+                        modalities: ["audio"], // modelo responde falando
+                    }
+                });
+            };
+        }
+
+        function stop() {
+            try { dataChannel?.close(); } catch { }
+            try { pc?.close(); } catch { }
+            micStream?.getTracks().forEach(t => t.stop());
+            setStatus("idle");
+        }
+
+        /* ---------- 5) Event loop Realtime: tool-calls, transcripts, etc ---------- */
+        async function onEventFromModel(msg) {
+            let ev;
+            try { ev = JSON.parse(msg.data); } catch { return; }
+
+            // Mostra transcrição do que o cliente falou, se vier
+            if (ev.type === "response.output_text.delta") {
+                // texto que o modelo está falando (opcional mostrar)
+            }
+            if (ev.type === "conversation.item.input_audio_transcription.completed") {
+                document.getElementById("transcript").textContent = ev.transcript || "";
+            }
+
+            // Tool calling:
+            // O modelo envia "response.output_item.add" com item.type="function_call"
+            if (ev.type === "response.output_item.add" && ev.item?.type === "function_call") {
+                const { name, arguments: args } = ev.item;
+                const impl = tools[name];
+                let toolResult = { ok: false, error: "unknown tool" };
+                try { toolResult = impl ? impl(args || {}) : toolResult; } catch (e) { toolResult = { ok: false, error: e.message }; }
+
+                // Retornamos a saída da tool ao modelo
+                send({
+                    type: "tool_output.create",
+                    tool_output: {
+                        tool_call_id: ev.item.id, // id do call atual
+                        content: [{ type: "output_text", text: JSON.stringify(toolResult) }]
+                    }
+                });
+
+                // Diga ao modelo para continuar a resposta (em áudio) após a tool
+                send({ type: "response.create", response: { modalities: ["audio"] } });
+            }
+        }
+
+        /* ---------- 6) UI bindings ---------- */
+        document.getElementById("connectBtn").onclick = start;
+        document.getElementById("hangBtn").onclick = stop;
+
+        /* ---------- 7) Segurança: exige interação do usuário p/ microfone ---------- */
+        // O botão "Start voice" já cobre essa permissão.
+    </script>
+</body>
+
+</html>
