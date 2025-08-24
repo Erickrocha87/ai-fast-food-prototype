@@ -98,10 +98,12 @@
     <div class="card">
         <div class="row">
             <input id="csv" type="file" accept=".csv" />
+            <button id="sendCsvBtn">Enviar CSV</button>
             <button id="connectBtn">🎤 Start voice</button>
             <button id="hangBtn" class="secondary">⛔ Stop</button>
         </div>
         <small>Dica: carregue um CSV com colunas <b>name,price</b> (e opcional <b>description</b>).</small>
+        <div id="menuTableArea"></div>
     </div>
 
     <div class="card">
@@ -134,6 +136,7 @@
         /* ---------- 0) Estado local ---------- */
         let pc, dataChannel, micStream;
         let menu = [];  // [{name, price, description}]
+        let menuCsvText = "";
         const order = new Map(); // key=name -> {name, price, qty}
 
         /* ---------- 1) Utilitários ---------- */
@@ -213,6 +216,17 @@
         };
 
         // Definições (esquema) que o modelo vê no "session.update"
+        function getSystemInstructions() {
+            return `Você é um assistente de voz para restaurante.
+- Sempre fale e escreva apenas em *português do Brasil*.
+- Seja simpático e objetivo.
+- Confirme os itens pedidos em português, nunca traduza nomes próprios.
+- Use apenas as ferramentas fornecidas para gerenciar o pedido.
+- Preços estão no CSV fornecido; não invente itens.
+- Quando o cliente perguntar "o que tem", liste alguns itens com preços em reais (R$).
+- Ao final, ofereça resumo e total do pedido.
+\nMENU ATUAL (JSON): ${JSON.stringify(menu)}`;
+        }
         const toolDefs = [
             {
                 type: "function",
@@ -252,10 +266,51 @@
         document.getElementById("csv").addEventListener("change", async (e) => {
             const file = e.target.files?.[0];
             if (!file) return;
-            const text = await file.text();
-            menu = parseCSV(text);
-            if (menu.length === 0) alert("CSV vazio ou cabeçalho inválido. Campos esperados: name,price[,description]");
+            menuCsvText = await file.text();
+            // Não processa ainda, só armazena
         });
+
+        document.getElementById("sendCsvBtn").onclick = () => {
+            if (!menuCsvText) {
+                alert("Selecione um arquivo CSV antes de enviar.");
+                return;
+            }
+            menu = parseCSV(menuCsvText);
+            if (menu.length === 0) {
+                alert("CSV vazio ou cabeçalho inválido. Campos esperados: name,price[,description]");
+                return;
+            }
+            renderMenuTable();
+            // Envia o menu atualizado para a IA como contexto de sistema
+            if (dataChannel?.readyState === "open") {
+                send({
+                    type: "session.update",
+                    session: {
+                        instructions: getSystemInstructions(),
+                        tools: toolDefs
+                    }
+                });
+                console.log("Menu atualizado enviado para IA:", menu);
+            } else {
+                console.log("DataChannel não está pronto, menu não enviado para IA.");
+            }
+        };
+
+        function renderMenuTable() {
+            const area = document.getElementById("menuTableArea");
+            if (!menu || menu.length === 0) {
+                area.innerHTML = '<span style="color:#d00">Nenhum menu carregado.</span>';
+                return;
+            }
+            let html = '<h3>Itens do Menu Importado</h3>';
+            html += '<table style="width:100%;border-collapse:collapse">';
+            html += '<thead><tr><th>Nome</th><th>Preço</th><th>Descrição</th></tr></thead><tbody>';
+            for (const item of menu) {
+                html += `<tr><td>${item.name}</td><td>R$ ${item.price.toFixed(2)}</td><td>${item.description || ''}</td></tr>`;
+            }
+            html += '</tbody></table>';
+            area.innerHTML = html;
+        }
 
         /* ---------- 4) Realtime WebRTC: start/stop ---------- */
         async function start() {
@@ -269,6 +324,24 @@
             dataChannel.onopen = () => {
                 setStatus("listening");
                 console.log("IA está escutando o áudio!");
+                // Atualiza sessão com instruções, tools e menu
+                send({
+                    type: "session.update",
+                    session: {
+                        instructions: getSystemInstructions(),
+                        tools: toolDefs
+                    }
+                });
+                send({
+                    type: "input_audio_buffer.commit"
+                });
+                send({
+                    type: "response.create",
+                    response: {
+                        instructions: `Converse em português do Brasil sempre.`,
+                        modalities: ["audio"]
+                    }
+                });
             };
             dataChannel.onmessage = onEventFromModel;
 
