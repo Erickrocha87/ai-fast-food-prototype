@@ -425,12 +425,15 @@
             try { ev = JSON.parse(msg.data); } catch { return; }
 
             console.log("EV", ev);
-            // Mostra transcrição do que o cliente falou, se vier
-            if (ev.type === "response.output_text.delta") {
-                // texto que o modelo está falando (opcional mostrar)
+            // Transcrição do cliente em tempo real
+            if (!window._transcriptBuffer) window._transcriptBuffer = "";
+            if (ev.type === "response.audio_transcript.delta" && ev.delta) {
+                window._transcriptBuffer += ev.delta;
+                document.getElementById("transcript").textContent = window._transcriptBuffer;
             }
-            if (ev.type === "conversation.item.input_audio_transcription.completed") {
-                document.getElementById("transcript").textContent = ev.transcript || "";
+            if (ev.type === "response.audio_transcript.done" && ev.transcript) {
+                document.getElementById("transcript").textContent = ev.transcript;
+                window._transcriptBuffer = "";
             }
 
             // Tool calling:
