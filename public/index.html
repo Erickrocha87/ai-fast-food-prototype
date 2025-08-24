@@ -187,6 +187,7 @@
         /* ---------- 2) Tools (funções que o modelo pode chamar) ---------- */
         const tools = {
             add_to_order: ({ name, quantity }) => {
+                console.log('[TOOL] add_to_order chamada:', { name, quantity });
                 const item = menu.find(m => m.name.toLowerCase() === String(name || "").toLowerCase());
                 if (!item) return { ok: false, error: `Item "${name}" not found` };
                 const prev = order.get(item.name) || { name: item.name, price: item.price, qty: 0 };
@@ -221,10 +222,12 @@
 - Sempre fale e escreva apenas em *português do Brasil*.
 - Seja simpático e objetivo.
 - Confirme os itens pedidos em português, nunca traduza nomes próprios.
-- Use apenas as ferramentas fornecidas para gerenciar o pedido.
+- Use SEMPRE as ferramentas fornecidas para gerenciar o pedido, principalmente add_to_order para adicionar itens.
+- Quando o cliente pedir um item, utilize a função add_to_order para adicionar ao pedido.
 - Preços estão no CSV fornecido; não invente itens.
 - Quando o cliente perguntar "o que tem", liste alguns itens com preços em reais (R$).
 - Ao final, ofereça resumo e total do pedido.
+- Nunca responda que não pode adicionar itens, sempre tente usar add_to_order quando solicitado.
 \nMENU ATUAL (JSON): ${JSON.stringify(menu)}`;
         }
         const toolDefs = [
@@ -414,9 +417,14 @@
 
         /* ---------- 5) Event loop Realtime: tool-calls, transcripts, etc ---------- */
         async function onEventFromModel(msg) {
+
+
             let ev;
+
+            console.log("msg", msg);
             try { ev = JSON.parse(msg.data); } catch { return; }
 
+            console.log("EV", ev);
             // Mostra transcrição do que o cliente falou, se vier
             if (ev.type === "response.output_text.delta") {
                 // texto que o modelo está falando (opcional mostrar)
@@ -427,8 +435,14 @@
 
             // Tool calling:
             // O modelo envia "response.output_item.add" com item.type="function_call"
-            if (ev.type === "response.output_item.add" && ev.item?.type === "function_call") {
-                const { name, arguments: args } = ev.item;
+            if (ev.type === "response.output_item.done" && ev.item?.type === "function_call") {
+                let args = ev.item.arguments;
+                // Se vier como string, tenta converter para objeto
+                if (typeof args === "string") {
+                    try { args = JSON.parse(args); } catch { args = {}; }
+                }
+                console.log('[IA] Chamou', ev.item.name, args);
+                const name = ev.item.name;
                 const impl = tools[name];
                 let toolResult = { ok: false, error: "unknown tool" };
                 try { toolResult = impl ? impl(args || {}) : toolResult; } catch (e) { toolResult = { ok: false, error: e.message }; }
